@@ -1,0 +1,8 @@
+demo/.godot/
+demo/*.log
+.DS_Store
+*.zip
+Godot-Movement-Inspector-Guide.md
+VALIDATION.md
+BASE_VERSION.txt
+build-macos.sh

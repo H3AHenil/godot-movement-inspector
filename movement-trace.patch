@@ -1,0 +1,284 @@
+diff --git a/scene/3d/physics/character_body_3d.cpp b/scene/3d/physics/character_body_3d.cpp
+index 19bebc5..4d1ae78 100644
+--- a/scene/3d/physics/character_body_3d.cpp
++++ b/scene/3d/physics/character_body_3d.cpp
+@@ -41,6 +41,17 @@
+ #define FLOOR_ANGLE_THRESHOLD 0.01
+ 
+ bool CharacterBody3D::move_and_slide() {
++#ifdef DEBUG_ENABLED
++	if (movement_trace_enabled) {
++		movement_trace_steps.clear();
++		movement_trace_truncated = false;
++		movement_trace_grounded = motion_mode == MOTION_MODE_GROUNDED;
++		movement_trace_call++;
++		movement_trace_frame = Engine::get_singleton()->get_physics_frames();
++		movement_trace_up = up_direction;
++		movement_trace_start = get_global_position();
++	}
++#endif
+ 	// Hack in order to work with calling from _process as well as from _physics_process; calling from thread is risky
+ 	double delta = Engine::get_singleton()->is_in_physics_frame() ? get_physics_process_delta_time() : get_process_delta_time();
+ 
+@@ -134,6 +145,12 @@ bool CharacterBody3D::move_and_slide() {
+ 		}
+ 	}
+ 
++#ifdef DEBUG_ENABLED
++	if (movement_trace_enabled) {
++		movement_trace_end = get_global_position();
++		movement_trace_velocity_end = velocity;
++	}
++#endif
+ 	return motion_results.size() > 0;
+ }
+ 
+@@ -167,9 +184,25 @@ void CharacterBody3D::_move_and_slide_grounded(double p_delta, bool p_was_on_flo
+ 		parameters.max_collisions = 6; // There can be 4 collisions between 2 walls + 2 more for the floor.
+ 		parameters.recovery_as_collision = true; // Also report collisions generated only from recovery.
+ 
++#ifdef DEBUG_ENABLED
++		MovementTraceStep trace_step;
++		if (movement_trace_enabled) {
++			trace_step.iteration = iteration;
++			trace_step.origin = parameters.from.origin;
++			trace_step.requested_motion = motion;
++			trace_step.velocity_before = velocity;
++		}
++#endif
+ 		PhysicsServer3D::MotionResult result;
+ 		bool collided = move_and_collide(parameters, result, false, !sliding_enabled);
+ 
++#ifdef DEBUG_ENABLED
++		if (movement_trace_enabled) {
++			// Save before grounded movement code adjusts result.travel.
++			trace_step.query_result = result;
++			trace_step.query_collided = collided;
++		}
++#endif
+ 		last_motion = result.travel;
+ 
+ 		if (collided) {
+@@ -179,6 +212,14 @@ void CharacterBody3D::_move_and_slide_grounded(double p_delta, bool p_was_on_flo
+ 
+ 			CollisionState result_state;
+ 			_set_collision_direction(result, result_state);
++#ifdef DEBUG_ENABLED
++			if (movement_trace_enabled) {
++				// Actual aggregate decision, including combined-normal handling.
++				trace_step.floor = result_state.floor;
++				trace_step.wall = result_state.wall;
++				trace_step.ceiling = result_state.ceiling;
++			}
++#endif
+ 
+ 			// If we hit a ceiling platform, we set the vertical velocity to at least the platform one.
+ 			if (collision_state.ceiling && platform_ceiling_velocity != Vector3() && platform_ceiling_velocity.dot(up_direction) < 0) {
+@@ -202,11 +243,21 @@ void CharacterBody3D::_move_and_slide_grounded(double p_delta, bool p_was_on_flo
+ 				velocity = Vector3();
+ 				motion = Vector3();
+ 				last_motion = Vector3();
++#ifdef DEBUG_ENABLED
++				if (movement_trace_enabled) {
++					_finish_movement_trace_step(trace_step, motion, "stop_on_slope");
++				}
++#endif
+ 				break;
+ 			}
+ 
+ 			if (result.remainder.is_zero_approx()) {
+ 				motion = Vector3();
++#ifdef DEBUG_ENABLED
++				if (movement_trace_enabled) {
++					_finish_movement_trace_step(trace_step, motion, "no_remainder");
++				}
++#endif
+ 				break;
+ 			}
+ 
+@@ -382,6 +433,19 @@ void CharacterBody3D::_move_and_slide_grounded(double p_delta, bool p_was_on_flo
+ 			collided = true;
+ 		}
+ 
++#ifdef DEBUG_ENABLED
++		if (movement_trace_enabled) {
++			StringName reason = "continue";
++			if (!collided) {
++				reason = "no_collision";
++			} else if (motion.is_zero_approx()) {
++				reason = "motion_zero";
++			} else if (iteration + 1 == max_slides) {
++				reason = "max_slides";
++			}
++			_finish_movement_trace_step(trace_step, motion, reason);
++		}
++#endif
+ 		if (!collided || motion.is_zero_approx()) {
+ 			break;
+ 		}
+@@ -636,6 +700,91 @@ void CharacterBody3D::_set_platform_data(const PhysicsServer3D::MotionCollision
+ 	}
+ }
+ 
++#ifdef DEBUG_ENABLED
++void CharacterBody3D::set_movement_trace_enabled(bool p_enabled) {
++	movement_trace_enabled = p_enabled;
++	if (!p_enabled) {
++		movement_trace_steps.clear();
++		movement_trace_truncated = false;
++	}
++}
++
++bool CharacterBody3D::is_movement_trace_enabled() const {
++	return movement_trace_enabled;
++}
++
++void CharacterBody3D::_finish_movement_trace_step(MovementTraceStep &r_step, const Vector3 &p_motion, const StringName &p_reason) {
++	if (movement_trace_steps.size() >= MOVEMENT_TRACE_LIMIT) {
++		movement_trace_truncated = true;
++		return;
++	}
++	r_step.motion_after = p_motion;
++	r_step.velocity_after = velocity;
++	r_step.origin_after = get_global_position();
++	r_step.exit_reason = p_reason;
++	movement_trace_steps.push_back(r_step);
++}
++
++Dictionary CharacterBody3D::get_movement_trace() const {
++	Dictionary trace;
++	trace["enabled"] = movement_trace_enabled;
++	trace["grounded"] = movement_trace_grounded;
++	trace["call"] = movement_trace_call;
++	trace["physics_frame"] = movement_trace_frame;
++	trace["truncated"] = movement_trace_truncated;
++	trace["start"] = movement_trace_start;
++	trace["end"] = movement_trace_end;
++	trace["velocity_end"] = movement_trace_velocity_end;
++	Array steps;
++	for (const MovementTraceStep &step : movement_trace_steps) {
++		Dictionary entry;
++		entry["iteration"] = step.iteration;
++		entry["origin"] = step.origin;
++		entry["origin_after"] = step.origin_after;
++		entry["requested_motion"] = step.requested_motion;
++		entry["velocity_before"] = step.velocity_before;
++		entry["travel"] = step.query_result.travel;
++		entry["remainder"] = step.query_result.remainder;
++		entry["query_collided"] = step.query_collided;
++		entry["floor"] = step.floor;
++		entry["wall"] = step.wall;
++		entry["ceiling"] = step.ceiling;
++		entry["motion_after"] = step.motion_after;
++		entry["velocity_after"] = step.velocity_after;
++		entry["exit_reason"] = step.exit_reason;
++		Array contacts;
++		for (int i = 0; i < step.query_result.collision_count; i++) {
++			const PhysicsServer3D::MotionCollision &collision = step.query_result.collisions[i];
++			Dictionary contact;
++			contact["position"] = collision.position;
++			contact["normal"] = collision.normal;
++			contact["depth"] = collision.depth;
++			const bool valid = !collision.normal.is_zero_approx() && !movement_trace_up.is_zero_approx();
++			contact["math_valid"] = valid;
++			if (valid) {
++				const Vector3 n = collision.normal.normalized();
++				const Vector3 up = movement_trace_up.normalized();
++				const real_t alignment = CLAMP(n.dot(up), (real_t)-1.0, (real_t)1.0);
++				contact["angle_degrees"] = Math::rad_to_deg(Math::acos(alignment));
++				const Vector3 perpendicular = n * step.query_result.remainder.dot(n);
++				contact["normal_component"] = perpendicular;
++				contact["tangent_component"] = step.query_result.remainder - perpendicular;
++				// A stable basis for drawing a small contact-plane marker
++				const Vector3 reference = Math::abs(n.dot(Vector3(0, 1, 0))) < (real_t)0.9 ? Vector3(0, 1, 0) : Vector3(1, 0, 0);
++				const Vector3 tangent = n.cross(reference).normalized();
++				contact["plane_tangent"] = tangent;
++				contact["plane_bitangent"] = n.cross(tangent).normalized();
++			}
++			contacts.push_back(contact);
++		}
++		entry["contacts"] = contacts;
++		steps.push_back(entry);
++	}
++	trace["steps"] = steps;
++	return trace;
++}
++#endif
++
+ void CharacterBody3D::set_safe_margin(real_t p_margin) {
+ 	margin = p_margin;
+ }
+@@ -867,6 +1016,11 @@ void CharacterBody3D::_notification(int p_what) {
+ }
+ 
+ void CharacterBody3D::_bind_methods() {
++#ifdef DEBUG_ENABLED
++	ClassDB::bind_method(D_METHOD("set_movement_trace_enabled", "enabled"), &CharacterBody3D::set_movement_trace_enabled);
++	ClassDB::bind_method(D_METHOD("is_movement_trace_enabled"), &CharacterBody3D::is_movement_trace_enabled);
++	ClassDB::bind_method(D_METHOD("get_movement_trace"), &CharacterBody3D::get_movement_trace);
++#endif
+ 	ClassDB::bind_method(D_METHOD("move_and_slide"), &CharacterBody3D::move_and_slide);
+ 	ClassDB::bind_method(D_METHOD("apply_floor_snap"), &CharacterBody3D::apply_floor_snap);
+ 
+diff --git a/scene/3d/physics/character_body_3d.h b/scene/3d/physics/character_body_3d.h
+index 34c70d6..6ef24da 100644
+--- a/scene/3d/physics/character_body_3d.h
++++ b/scene/3d/physics/character_body_3d.h
+@@ -30,6 +30,8 @@
+ 
+ #pragma once
+ 
++#include "core/variant/dictionary.h"
++
+ #include "scene/3d/physics/kinematic_collision_3d.h"
+ #include "scene/3d/physics/physics_body_3d.h"
+ 
+@@ -46,6 +48,11 @@ public:
+ 		PLATFORM_ON_LEAVE_ADD_UPWARD_VELOCITY,
+ 		PLATFORM_ON_LEAVE_DO_NOTHING,
+ 	};
++#ifdef DEBUG_ENABLED
++	void set_movement_trace_enabled(bool p_enabled);
++	bool is_movement_trace_enabled() const;
++	Dictionary get_movement_trace() const;
++#endif
+ 	bool move_and_slide();
+ 	void apply_floor_snap();
+ 
+@@ -114,6 +121,36 @@ public:
+ 	CharacterBody3D();
+ 
+ private:
++#ifdef DEBUG_ENABLED
++	// Value snapshots only: no references into the solver survive a call
++	struct MovementTraceStep {
++		int iteration = 0;
++		Vector3 origin;
++		Vector3 requested_motion;
++		Vector3 velocity_before;
++		PhysicsServer3D::MotionResult query_result;
++		bool query_collided = false;
++		bool floor = false;
++		bool wall = false;
++		bool ceiling = false;
++		Vector3 motion_after;
++		Vector3 velocity_after;
++		Vector3 origin_after;
++		StringName exit_reason;
++	};
++	static constexpr int MOVEMENT_TRACE_LIMIT = 64;
++	bool movement_trace_enabled = false;
++	bool movement_trace_truncated = false;
++	bool movement_trace_grounded = false;
++	uint64_t movement_trace_call = 0;
++	uint64_t movement_trace_frame = 0;
++	Vector3 movement_trace_up;
++	Vector3 movement_trace_start;
++	Vector3 movement_trace_end;
++	Vector3 movement_trace_velocity_end;
++	Vector<MovementTraceStep> movement_trace_steps;
++	void _finish_movement_trace_step(MovementTraceStep &r_step, const Vector3 &p_motion, const StringName &p_reason);
++#endif
+ 	real_t margin = 0.001;
+ 	MotionMode motion_mode = MOTION_MODE_GROUNDED;
+ 	PlatformOnLeave platform_on_leave = PLATFORM_ON_LEAVE_ADD_VELOCITY;
